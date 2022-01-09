@@ -112,7 +112,42 @@ func (c *MRCluster) worker() {
 				// hint: don't encode results returned by ReduceF, and just output
 				// them into the destination file directly so that users can get
 				// results formatted as what they want.
-				panic("YOUR CODE HERE")
+
+				// 1. read intermediate results from nMap tasks
+				rfs := make([]*os.File, t.nMap)
+				rbs := make([]*bufio.Reader, t.nMap)
+				rpaths := mapNames(t.dataDir, t.jobName, t.nMap, t.taskNumber)
+				for i := range rfs {
+					rfs[i], rbs[i] = OpenFileAndBuf(rpaths[i])
+				}
+				results := map[string][]string{}
+				// 2. sort/merge intermediate results by key
+				for _, bs := range rbs {
+					for {
+						line, err := bs.ReadBytes('\n')
+						if err != nil {
+							break
+						}
+						kv := KeyValue{}
+						json.Unmarshal(line, &kv)
+						results[kv.Key] = append(results[kv.Key], kv.Value)
+					}
+				}
+
+				// 3. reduce and save to file
+				mergeFile := mergeName(t.dataDir, t.jobName, t.taskNumber)
+				fs, bs := CreateFileAndBuf(mergeFile)
+				for k, v := range results {
+					output := t.reduceF(k, v)
+					bs.WriteString(output)
+				}
+
+				// 4. close files
+				for i := range rfs {
+					rfs[i].Close()
+				}
+				SafeClose(fs, bs)
+
 			}
 			t.wg.Done()
 		case <-c.exit:
@@ -158,8 +193,30 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 	}
 
 	// reduce phase
-	// YOUR CODE HERE :D
-	panic("YOUR CODE HERE")
+	rtasks := make([]*task, 0, nReduce)
+	for i := 0; i < nReduce; i++ {
+		t := &task{
+			dataDir:    dataDir,
+			jobName:    jobName,
+			phase:      reducePhase,
+			taskNumber: i,
+			nReduce:    nReduce,
+			nMap:       nMap,
+			reduceF:    reduceF,
+		}
+		t.wg.Add(1)
+		rtasks = append(rtasks, t)
+		go func() { c.taskCh <- t }()
+	}
+	for _, t := range rtasks {
+		t.wg.Wait()
+	}
+
+	reduceFiles := []string{}
+	for i := 0; i < nReduce; i++ {
+		reduceFiles = append(reduceFiles, mergeName(dataDir, jobName, i))
+	}
+	notify <- reduceFiles
 }
 
 func ihash(s string) int {
@@ -170,6 +227,14 @@ func ihash(s string) int {
 
 func reduceName(dataDir, jobName string, mapTask int, reduceTask int) string {
 	return path.Join(dataDir, "mrtmp."+jobName+"-"+strconv.Itoa(mapTask)+"-"+strconv.Itoa(reduceTask))
+}
+
+func mapNames(dataDir, jobName string, nMap int, reduceTask int) []string {
+	res := []string{}
+	for i := 0; i < nMap; i++ {
+		res = append(res, path.Join(dataDir, "mrtmp."+jobName+"-"+strconv.Itoa(i)+"-"+strconv.Itoa(reduceTask)))
+	}
+	return res
 }
 
 func mergeName(dataDir, jobName string, reduceTask int) string {
